@@ -1,4 +1,5 @@
 const { v4: uuidv4 } = require('uuid');
+const mongoose = require('mongoose');
 const Inventory = require('../model/inventory');
 const Reservation = require('../model/reservation');
 
@@ -25,71 +26,121 @@ async function reserve({ sku, qty, userId, reservationId = null, ttlMs = 5 * 60 
   const existing = await Reservation.findOne({ reservationId }).lean();
   if (existing) return { reservationId, ...existing, idempotent: true };
 
-  // Atomically increase reserved only if enough available
-  const filter = {
-    sku,
-    $expr: { $gte: [{ $subtract: ['$stock', '$reserved'] }, qty] }
-  };
-  const upd = { $inc: { reserved: qty } };
-  const r = await Inventory.updateOne(filter, upd);
-  if (!r.matchedCount || r.matchedCount === 0) {
-    console.log('Insufficient stock for reservation', r.matchedCount);
-    throw new Error('insufficient_stock');
+  const session = await mongoose.startSession();
+  let result;
+  try {
+    await session.withTransaction(async () => {
+      // Atomically increase reserved only if enough available
+      const filter = {
+        sku,
+        $expr: { $gte: [{ $subtract: ['$stock', '$reserved'] }, qty] }
+      };
+      const upd = { $inc: { reserved: qty } };
+      const r = await Inventory.updateOne(filter, upd).session(session);
+      if (!r.matchedCount || r.matchedCount === 0) {
+        throw new Error('insufficient_stock');
+      }
+
+      const expiresAt = new Date(Date.now() + ttlMs);
+      const created = await Reservation.create([{ reservationId, sku, qty, userId, expiresAt, status: 'active' }], { session });
+      result = { reservationId, sku, qty, userId, expiresAt: created[0].expiresAt, status: 'active' };
+    });
+  } finally {
+    session.endSession();
   }
 
-  const expiresAt = new Date(Date.now() + ttlMs);
-  const reservationDoc = await Reservation.create({ reservationId, sku, qty, userId, expiresAt, status: 'active' });
-
-  return { reservationId, sku, qty, userId, expiresAt: reservationDoc.expiresAt, status: 'active' };
+  return result;
 }
 
 async function confirm(reservationId) {
-  const r = await Reservation.findOne({ reservationId });
-  if (!r) throw new Error('reservation_not_found');
-  if (r.status === 'confirmed') return { reservationId, status: 'confirmed' };
-  if (r.status === 'expired') throw new Error('reservation_expired');
-  if (r.status !== 'active') throw new Error('invalid_reservation_state');
+  const session = await mongoose.startSession();
+  let result;
+  try {
+    await session.withTransaction(async () => {
+      const r = await Reservation.findOne({ reservationId }).session(session);
+      if (!r) throw new Error('reservation_not_found');
+      if (r.status === 'confirmed') {
+        result = { reservationId, status: 'confirmed' };
+        return;
+      }
+      if (r.status === 'expired') throw new Error('reservation_expired');
+      if (r.status !== 'active') throw new Error('invalid_reservation_state');
 
-  // Atomically decrement stock and reserved
-  const filter = {
-    sku: r.sku,
-    $expr: { $and: [{ $gte: ['$reserved', r.qty] }, { $gte: ['$stock', r.qty] }] }
-  };
-  const upd = { $inc: { stock: -r.qty, reserved: -r.qty } };
-  const invRes = await Inventory.updateOne(filter, upd);
-  if (!invRes.matchedCount || invRes.matchedCount === 0) {
-    throw new Error('insufficient_stock_on_confirm');
+      // Atomically decrement stock and reserved
+      const filter = {
+        sku: r.sku,
+        $expr: { $and: [{ $gte: ['$reserved', r.qty] }, { $gte: ['$stock', r.qty] }] }
+      };
+      const upd = { $inc: { stock: -r.qty, reserved: -r.qty } };
+      const invRes = await Inventory.updateOne(filter, upd).session(session);
+      if (!invRes.matchedCount || invRes.matchedCount === 0) {
+        // If inventory update failed, re-check reservation status to provide idempotent behavior
+        const latest = await Reservation.findOne({ reservationId }).session(session);
+        if (latest && latest.status === 'confirmed') {
+          result = { reservationId, status: 'confirmed' };
+          return;
+        }
+        throw new Error('insufficient_stock_on_confirm');
+      }
+
+      r.status = 'confirmed';
+      await r.save({ session });
+      result = { reservationId, status: 'confirmed' };
+    });
+  } finally {
+    session.endSession();
   }
 
-  r.status = 'confirmed';
-  await r.save();
-  return { reservationId, status: 'confirmed' };
+  return result;
 }
 
 async function cancel(reservationId) {
-  const r = await Reservation.findOne({ reservationId });
-  if (!r) throw new Error('reservation_not_found');
-  if (r.status === 'canceled' || r.status === 'expired') return { reservationId, status: r.status };
+  const session = await mongoose.startSession();
+  let result;
+  try {
+    await session.withTransaction(async () => {
+      const r = await Reservation.findOne({ reservationId }).session(session);
+      if (!r) throw new Error('reservation_not_found');
+      if (r.status === 'canceled' || r.status === 'expired') {
+        result = { reservationId, status: r.status };
+        return;
+      }
+      if (r.status === 'confirmed') {
+        result = { reservationId, status: 'confirmed' };
+        return;
+      }
 
-  if (r.status === 'confirmed') return { reservationId, status: 'confirmed' };
+      // only active reservations decrement reserved
+      if (r.status === 'active') {
+        const updated = await Reservation.findOneAndUpdate({ reservationId, status: 'active' }, { $set: { status: 'canceled' } }, { new: true, session });
+        if (updated) {
+          await Inventory.updateOne({ sku: r.sku }, { $inc: { reserved: -r.qty } }).session(session);
+          result = { reservationId, status: 'canceled' };
+          return;
+        }
+      }
 
-  // only active reservations decrement reserved
-  if (r.status === 'active') {
-    const updated = await Reservation.findOneAndUpdate({ reservationId, status: 'active' }, { $set: { status: 'canceled' } }, { new: true });
-    if (updated) {
-      await Inventory.updateOne({ sku: r.sku }, { $inc: { reserved: -r.qty } });
-      return { reservationId, status: 'canceled' };
-    }
+      result = { reservationId, status: r.status };
+    });
+  } finally {
+    session.endSession();
   }
 
-  return { reservationId, status: r.status };
+  return result;
 }
 
 async function expireReservation(reservationId, qty, sku) {
-  // set to expired only if still active
-  const updated = await Reservation.findOneAndUpdate({ reservationId, status: 'active' }, { $set: { status: 'expired' } });
-  if (updated) {
-    await Inventory.updateOne({ sku }, { $inc: { reserved: -qty } });
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      // set to expired only if still active
+      const updated = await Reservation.findOneAndUpdate({ reservationId, status: 'active' }, { $set: { status: 'expired' } }, { session });
+      if (updated) {
+        await Inventory.updateOne({ sku }, { $inc: { reserved: -qty } }).session(session);
+      }
+    });
+  } finally {
+    session.endSession();
   }
 }
 
